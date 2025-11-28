@@ -186,32 +186,43 @@ NEGATION_WORDS = frozenset({
 
 
 REASONING_CONNECTORS = frozenset({
-    # causal
-    "because", "since", "as", "given", "therefore",
-    "hence", "thus", "consequently", "accordingly",
-    "resulting", "resulting_in",
+    # causal (strong logical connectors)
+    "because", "since", "therefore", "hence", "thus",
+    "consequently", "accordingly", "so", "ergo",
 
     # contrast / concession
-    "however", "although", "though", "even_though",
-    "whereas", "while", "yet", "nonetheless",
-    "nevertheless", "despite", "in_spite_of",
-    "on_the_other_hand",
+    "however", "although", "though", "whereas",
+    "yet", "nonetheless", "nevertheless", "despite",
+    "conversely", "alternatively",
 
     # additive / sequencing
     "moreover", "furthermore", "additionally",
-    "besides", "also", "next", "then", "afterward",
-    "initially", "first", "second", "third", "finally",
+    "besides", "afterward", "initially",
+    "first", "second", "third", "finally",
+    "subsequently", "previously",
 
     # conditional
     "if", "unless", "provided", "assuming",
-    "in_case", "otherwise", "rather",
+    "otherwise", "rather",
 
     # justification / inference
-    "indicating", "implying", "meaning",
-    "thereby", "according_to",
+    "indicating", "implying", "suggests", "indicates",
+    "implies", "shows", "demonstrates", "meaning",
+    "thereby", "confirms", "supports",
+
+    # emphasis / focus (signal key reasoning steps)
+    "notably", "importantly", "crucially", "specifically",
+    "particularly", "especially", "primarily", "mainly",
+
+    # conclusive markers
+    "ultimately", "overall", "essentially", "clearly",
+    "evidently", "obviously",
+
+    # comparative
+    "similarly", "likewise", "namely", "indeed",
 
     # reasoning meta-markers
-    "considering", "based_on", "given_that",
+    "considering", "given", "assuming",
 })
 
 
@@ -379,19 +390,40 @@ def extract_fast_text_features(text: str) -> Optional[Dict[str, float]]:
     certainty_denom = confidence_count + hedge_count
     certainty_score = (confidence_count - hedge_count) / certainty_denom if certainty_denom > 0 else 0
 
-    features = {
-        # Basic counts
-        "fast_total_word_count": float(total_words),
-        "fast_unique_word_count": float(unique_word_count),
-        "fast_sentence_count": float(sentence_count),
-        "fast_question_count": float(question_count),
+    # --- NEW FEATURES ---
+    # Vocabulary growth rate: how fast does vocabulary saturate?
+    # Split words into 3 parts, calculate cumulative unique words
+    # Rate < 1 means vocabulary saturates (repetitive), > 1 means keeps growing (diverse)
+    if total_words >= 6:
+        third = total_words // 3
+        words_part1 = words[:third]
+        words_part2 = words[:2*third]
+        words_part3 = words  # all words
 
-        # Keyword counts
-        "fast_hedge_count": float(hedge_count),
-        "fast_reasoning_connector_count": float(reasoning_count),
-        "fast_differential_keyword_count": float(differential_count),
-        "fast_conclusion_word_count": float(conclusion_count),
-        "fast_medical_action_count": float(medical_action_count),
+        unique_part1 = len(set(words_part1))
+        unique_part2 = len(set(words_part2))
+        unique_part3 = len(set(words_part3))
+
+        # Growth rate: ratio of actual unique words vs expected if linear
+        # Expected at part 2: unique_part1 * 2, Expected at part 3: unique_part1 * 3
+        expected_part2 = unique_part1 * 2
+        expected_part3 = unique_part1 * 3
+        vocab_growth_rate = ((unique_part2 / (expected_part2 + 1e-9)) +
+                            (unique_part3 / (expected_part3 + 1e-9))) / 2
+    else:
+        vocab_growth_rate = 1.0  # neutral for short texts
+
+    features = {
+        # Basic counts (commented out - absolute values correlate with text length)
+        # "fast_total_word_count": float(total_words),
+        # "fast_sentence_count": float(sentence_count),
+        # "fast_question_count": float(question_count),
+
+        # Keyword densities (normalized)
+        # "fast_hedge_count": float(hedge_count),  # use fast_hedge_ratio instead
+        "fast_differential_density": differential_count / total_words,
+        "fast_conclusion_density": conclusion_count / total_words,
+        # "fast_medical_action_count": float(medical_action_count),  # low importance
 
         # Structure metrics
         "fast_avg_word_length": avg_word_length,
@@ -402,12 +434,14 @@ def extract_fast_text_features(text: str) -> Optional[Dict[str, float]]:
         "fast_hedge_ratio": hedge_ratio,
         "fast_confidence_ratio": confidence_ratio,
         "fast_negation_ratio": negation_ratio,
-        "fast_reasoning_density": reasoning_count / total_words,
         "fast_question_density": question_count / sentence_count,
 
         # Composite scores
         "fast_certainty_score": certainty_score,
         "fast_analytical_score": (reasoning_count + differential_count) / total_words,
+
+        # New features
+        "fast_vocab_growth_rate": vocab_growth_rate,
     }
 
     return features
@@ -416,25 +450,24 @@ def extract_fast_text_features(text: str) -> Optional[Dict[str, float]]:
 def _empty_features() -> Dict[str, float]:
     """Return feature dict with all zeros for empty/invalid text."""
     return {
-        "fast_total_word_count": 0.0,
-        "fast_unique_word_count": 0.0,
-        "fast_sentence_count": 0.0,
-        "fast_question_count": 0.0,
-        "fast_hedge_count": 0.0,
-        "fast_reasoning_connector_count": 0.0,
-        "fast_differential_keyword_count": 0.0,
-        "fast_conclusion_word_count": 0.0,
-        "fast_medical_action_count": 0.0,
+        # Absolute counts commented out
+        # "fast_total_word_count": 0.0,
+        # "fast_sentence_count": 0.0,
+        # "fast_question_count": 0.0,
+        # "fast_hedge_count": 0.0,
+        "fast_differential_density": 0.0,
+        "fast_conclusion_density": 0.0,
+        # "fast_medical_action_count": 0.0,
         "fast_avg_word_length": 0.0,
         "fast_vocabulary_richness": 0.0,
         "fast_hapax_ratio": 0.0,
         "fast_hedge_ratio": 0.0,
         "fast_confidence_ratio": 0.0,
         "fast_negation_ratio": 0.0,
-        "fast_reasoning_density": 0.0,
         "fast_question_density": 0.0,
         "fast_certainty_score": 0.0,
         "fast_analytical_score": 0.0,
+        "fast_vocab_growth_rate": 1.0,  # neutral default
     }
 
 

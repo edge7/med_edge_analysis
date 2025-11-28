@@ -230,7 +230,7 @@ def tune_classifier(
 PARAM_GRIDS = {
     "RandomForest": {
     "n_estimators": [200],
-    "max_depth": [3, 5, 7],
+    "max_depth": [5, 7],
     "max_features": ["sqrt", "log2"],
     "min_samples_split": [2, 5],
     "min_samples_leaf": [1, 2],

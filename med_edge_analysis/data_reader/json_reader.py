@@ -2,16 +2,24 @@ from dataclasses import dataclass
 from pandas import DataFrame
 import pandas as pd
 import json
+import hashlib
 from pathlib import Path
 from typing import List, Optional
 from loguru import logger
 
-from med_edge_analysis.constants import DATASETS, MODELS, SPLITS, MED_QA_DATASET
-from med_edge_analysis.feature_extractor.log_probs_extractor import extract_meta_features
-from med_edge_analysis.feature_extractor.fast_text_features import extract_fast_text_features
+
+def compute_question_hash(question: str, n_chars: int = 200) -> str:
+    """Compute MD5 hash of first n_chars of question for deduplication."""
+    text_to_hash = (question or "")[:n_chars]
+    return hashlib.md5(text_to_hash.encode()).hexdigest()
+
+from constants import DATASETS, MODELS, SPLITS, MED_QA_DATASET, PROPRIETARY_MODELS
+from feature_extractor.log_probs_extractor import extract_meta_features
+from feature_extractor.fast_text_features import extract_fast_text_features
 
 MED_QA_FOLDER = "/media/edge7/Extreme Pro/med_edge/benchmarks"
 MED_AGENT = "/media/edge7/Extreme Pro/med_edge/benchmarks_test"
+PROPRIETARY_FOLDER = "/media/edge7/Extreme Pro/med_edge/benchmarks_proprietary"
 
 
 @dataclass
@@ -154,6 +162,9 @@ def _read_jsonl(filepath: Path, chunk_size: int = 10000, columns: Optional[List[
                             else:
                                 features[meta_col] = record[meta_col]
 
+                    # Add question hash for cross-dataset deduplication
+                    features['question_hash'] = compute_question_hash(record.get('question', ''))
+
                     current_chunk.append(features)
 
                 except AssertionError as e:
@@ -168,10 +179,14 @@ def _read_jsonl(filepath: Path, chunk_size: int = 10000, columns: Optional[List[
                     continue
             else:
                 # Original behavior: load raw data
+                # Add question hash for cross-dataset deduplication (before filtering columns)
+                question_hash = compute_question_hash(record.get('question', ''))
+
                 # Filter columns if specified
                 if columns is not None:
                     record = {k: v for k, v in record.items() if k in columns}
                 record['sample_id'] = f"{record['dataset_name']}_{record.get('dataset_config', '')}_{record['sample_id']}"
+                record['question_hash'] = question_hash
                 current_chunk.append(record)
 
             # Process in chunks to avoid memory spikes
@@ -220,6 +235,12 @@ def get_baseline_stats(
     Returns:
         Dict with 'accuracy', 'n_correct', 'n_total' or None if file not found.
     """
+    is_proprietary = model in PROPRIETARY_MODELS
+
+    # Proprietary models only have med_qa data for now
+    if is_proprietary and dataset_name != MED_QA_DATASET:
+        return None
+
     # Determine which splits to load
     if split is None and dataset_name == MED_QA_DATASET:
         splits_to_load = SPLITS  # train, val, test
@@ -231,41 +252,27 @@ def get_baseline_stats(
     sample_ids_seen = set()
 
     for sp in splits_to_load:
-        # Construct filepath
-        if dataset_name == MED_QA_DATASET:
+        if is_proprietary:
+            # Proprietary: CSV files with timestamp pattern
+            filepath = _find_proprietary_file(model, sp)
+        elif dataset_name == MED_QA_DATASET:
             filepath = Path(MED_QA_FOLDER) / f"{model}_{sp}_raw.jsonl"
         else:
             filepath = Path(MED_AGENT) / f"{model}_medagents_{dataset_name}_{sp}_raw.jsonl"
 
-        if not filepath.exists():
+        if filepath is None or not filepath.exists():
             continue
 
-        # First pass: find inconsistent sample_ids
-        from collections import defaultdict
-        by_id = defaultdict(set)
-        with open(filepath, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    r = json.loads(line)
-                    by_id[r["sample_id"]].add(r["ground_truth"])
-        inconsistent_ids = {sid for sid, answers in by_id.items() if len(answers) > 1}
-
-        # Second pass: count correct/total (only read what we need)
-        with open(filepath, "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                # Minimal JSON parsing - only extract needed fields
-                record = json.loads(line)
-
-                sample_id = record["sample_id"]
-                if sample_id in sample_ids_seen or sample_id in inconsistent_ids:
-                    continue
-
-                sample_ids_seen.add(sample_id)
-                total_count += 1
-                if record["is_correct"]:
-                    total_correct += 1
+        if is_proprietary:
+            # Read CSV file
+            stats = _read_proprietary_csv_stats(filepath, sample_ids_seen)
+            total_correct += stats["n_correct"]
+            total_count += stats["n_total"]
+        else:
+            # Read JSONL file
+            stats = _read_jsonl_stats(filepath, sample_ids_seen)
+            total_correct += stats["n_correct"]
+            total_count += stats["n_total"]
 
     if total_count == 0:
         return None
@@ -275,6 +282,79 @@ def get_baseline_stats(
         "n_correct": total_correct,
         "n_total": total_count,
     }
+
+
+def _find_proprietary_file(model: str, split: str) -> Optional[Path]:
+    """Find the most recent proprietary CSV file for a model/split."""
+    import glob
+    pattern = str(Path(PROPRIETARY_FOLDER) / f"{model}_{split}_*.csv")
+    files = glob.glob(pattern)
+    if not files:
+        return None
+    # Return most recent (sorted by name, which includes timestamp)
+    return Path(sorted(files)[-1])
+
+
+def _read_proprietary_csv_stats(filepath: Path, sample_ids_seen: set) -> dict:
+    """Read stats from proprietary CSV file."""
+    import csv
+    from collections import defaultdict
+
+    # First pass: find inconsistent sample_ids (same logic as JSONL)
+    by_id = defaultdict(set)
+    with open(filepath, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            by_id[row["sample_id"]].add(row["ground_truth"])
+    inconsistent_ids = {sid for sid, answers in by_id.items() if len(answers) > 1}
+
+    # Second pass: count correct/total
+    n_correct = 0
+    n_total = 0
+    with open(filepath, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            sample_id = row["sample_id"]
+            if sample_id in sample_ids_seen or sample_id in inconsistent_ids:
+                continue
+            sample_ids_seen.add(sample_id)
+            n_total += 1
+            if row["is_correct"].lower() == "true":
+                n_correct += 1
+
+    return {"n_correct": n_correct, "n_total": n_total}
+
+
+def _read_jsonl_stats(filepath: Path, sample_ids_seen: set) -> dict:
+    """Read stats from JSONL file."""
+    from collections import defaultdict
+
+    # First pass: find inconsistent sample_ids
+    by_id = defaultdict(set)
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                r = json.loads(line)
+                by_id[r["sample_id"]].add(r["ground_truth"])
+    inconsistent_ids = {sid for sid, answers in by_id.items() if len(answers) > 1}
+
+    # Second pass: count correct/total
+    n_correct = 0
+    n_total = 0
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            sample_id = record["sample_id"]
+            if sample_id in sample_ids_seen or sample_id in inconsistent_ids:
+                continue
+            sample_ids_seen.add(sample_id)
+            n_total += 1
+            if record["is_correct"]:
+                n_correct += 1
+
+    return {"n_correct": n_correct, "n_total": n_total}
 
 
 def _optimize_dtypes(df: DataFrame) -> DataFrame:

@@ -13,7 +13,7 @@ def remove_collinear_features(X, threshold=0.85, method="pearson", verbose=True)
     Remove highly correlated features from a DataFrame.
 
     For each pair of correlated features (above threshold), keeps the one
-    that appears first in the DataFrame and drops the other.
+    with higher variance (more informative) and drops the other.
 
     Args:
         X: pandas DataFrame with features
@@ -26,8 +26,11 @@ def remove_collinear_features(X, threshold=0.85, method="pearson", verbose=True)
         tuple: (X_filtered, dropped_features, correlation_info)
             - X_filtered: DataFrame with collinear features removed
             - dropped_features: list of removed feature names
-            - correlation_info: list of tuples (dropped, kept, correlation)
+            - correlation_info: list of tuples (dropped, kept, correlation, dropped_var, kept_var)
     """
+    # Compute variance for each feature (used for selection criterion)
+    variances = X.var()
+
     # Compute correlation matrix
     corr_matrix = X.corr(method=method).abs()
 
@@ -44,10 +47,23 @@ def remove_collinear_features(X, threshold=0.85, method="pearson", verbose=True)
 
         for corr_feat in correlated:
             if corr_feat not in dropped_features and col not in dropped_features:
-                # Drop the one that comes later (col), keep the earlier one (corr_feat)
                 corr_value = corr_matrix.loc[corr_feat, col]
-                correlation_info.append((col, corr_feat, corr_value))
-                dropped_features.add(col)
+
+                # Keep the feature with higher variance
+                var_col = variances[col]
+                var_corr_feat = variances[corr_feat]
+
+                if var_col >= var_corr_feat:
+                    # col has higher variance -> keep col, drop corr_feat
+                    to_drop = corr_feat
+                    to_keep = col
+                else:
+                    # corr_feat has higher variance -> keep corr_feat, drop col
+                    to_drop = col
+                    to_keep = corr_feat
+
+                correlation_info.append((to_drop, to_keep, corr_value, variances[to_drop], variances[to_keep]))
+                dropped_features.add(to_drop)
 
     # Filter DataFrame
     kept_features = [col for col in X.columns if col not in dropped_features]
@@ -60,12 +76,13 @@ def remove_collinear_features(X, threshold=0.85, method="pearson", verbose=True)
         print(f"Original features: {len(X.columns)}")
         print(f"Dropped features:  {len(dropped_features)}")
         print(f"Remaining features: {len(kept_features)}")
+        print(f"Selection criterion: higher variance")
 
         if correlation_info:
-            print(f"\n{'Dropped':<30} {'Kept':<30} {'Corr'}")
-            print(f"{'─'*30} {'─'*30} {'─'*6}")
-            for dropped, kept, corr in sorted(correlation_info, key=lambda x: x[2], reverse=True):
-                print(f"{dropped:<30} {kept:<30} {corr:.3f}")
+            print(f"\n{'Dropped':<30} {'Kept':<30} {'Corr':>6} {'Drop Var':>10} {'Keep Var':>10}")
+            print(f"{'─'*30} {'─'*30} {'─'*6} {'─'*10} {'─'*10}")
+            for dropped, kept, corr, drop_var, keep_var in sorted(correlation_info, key=lambda x: x[2], reverse=True):
+                print(f"{dropped:<30} {kept:<30} {corr:.3f} {drop_var:>10.4f} {keep_var:>10.4f}")
         else:
             print("\nNo collinear features found.")
 

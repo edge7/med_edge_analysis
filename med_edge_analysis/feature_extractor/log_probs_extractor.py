@@ -1,7 +1,3 @@
-from typing import List
-import numpy as np
-from scipy.stats import linregress
-
 import numpy as np
 from typing import Dict, Any, List
 
@@ -46,13 +42,14 @@ def extract_meta_features(data: Dict[str, Any]) -> Dict[str, float]:
     # These capture the model's uncertainty over alternative token choices
     entropies = []
     margins = []
+    alt_entropies = []  # Entropy of alternatives only (excluding chosen token)
 
     for token in reasoning_tokens:
         tops = token.get("top_logprobs", [])
 
         assert len(tops) == 20 # We forced this in the ingestion phase
 
-            # Calculate entropy (measure of uncertainty across all alternatives)
+        # Calculate entropy (measure of uncertainty across all 20 alternatives)
         top_logprobs = np.array([float(t["logprob"]) for t in tops])
         probs = np.exp(top_logprobs)
         probs_norm = probs / np.sum(probs)
@@ -62,6 +59,14 @@ def extract_meta_features(data: Dict[str, Any]) -> Dict[str, float]:
         # Calculate margin (confidence gap between top-1 and top-2)
         margin = float(tops[0]["logprob"]) - float(tops[1]["logprob"])
         margins.append(margin)
+
+        # Calculate entropy of alternatives only (19 non-chosen tokens)
+        # This measures how "spread out" the model's uncertainty is among alternatives
+        alt_logprobs = np.array([float(t["logprob"]) for t in tops[1:]])  # exclude top-1
+        alt_probs = np.exp(alt_logprobs)
+        alt_probs_norm = alt_probs / np.sum(alt_probs)
+        alt_H = -np.sum(alt_probs_norm * np.log(alt_probs_norm + 1e-9))
+        alt_entropies.append(alt_H)
 
     # Aggregate entropy features
     if entropies:
@@ -89,43 +94,102 @@ def extract_meta_features(data: Dict[str, Any]) -> Dict[str, float]:
     else:
         raise Exception("This should not happen. Margin should be available")
 
-    # --- NEW: Temporal Evolution of Entropy/Margin (3-part split) ---
-    # Track how uncertainty evolves during reasoning: convergence vs divergence
+    # --- Temporal Evolution of Entropy (Trajectory Modeling) ---
+    # Track how uncertainty evolves during reasoning with robust, stable features
     if entropies:
         entropy_array = np.array(entropies)
-        entropy_parts = np.array_split(entropy_array, 3)
+        n_tokens = len(entropy_array)
 
+        # 3-part split averages (stable, 95% across models)
+        entropy_parts = np.array_split(entropy_array, 3)
         feats["entropy_start"] = np.mean(entropy_parts[0])
         feats["entropy_middle"] = np.mean(entropy_parts[1])
         feats["entropy_end"] = np.mean(entropy_parts[2])
 
-        # Convergence/Divergence trends
-        # Negative trend = model converges (uncertainty decreases) → GOOD
-        # Positive trend = model diverges (uncertainty increases) → BAD
-        feats["entropy_trend"] = feats["entropy_end"] - feats["entropy_start"]
-        feats["entropy_delta_middle"] = feats["entropy_middle"] - feats["entropy_start"]
+        # --- Volatility & Dynamics ---
+        # First derivative (token-to-token changes)
+        entropy_diff = np.diff(entropy_array)
+        feats["entropy_volatility"] = np.std(entropy_diff)  # how jumpy is the trajectory?
+
+        # --- Autocorrelation (clustering of high-entropy tokens) ---
+        # Lag-1 autocorrelation: are high-entropy tokens clustered together?
+        # High autocorr = uncertainty is clustered (model struggles with specific sections)
+        # Low autocorr = uncertainty is scattered (random noise)
+        if n_tokens > 2:
+            entropy_centered = entropy_array - np.mean(entropy_array)
+            autocorr_num = np.sum(entropy_centered[:-1] * entropy_centered[1:])
+            autocorr_denom = np.sum(entropy_centered ** 2)
+            feats["entropy_autocorr"] = autocorr_num / (autocorr_denom + 1e-9)
+        else:
+            feats["entropy_autocorr"] = 0.0
+
+        # --- Monotonicity (direction consistency) ---
+        # What fraction of steps show decreasing entropy? (convergence)
+        # High monotonicity = consistent trend, low = oscillating
+        decreasing_steps = np.sum(entropy_diff < 0)
+        feats["entropy_decrease_rate"] = decreasing_steps / len(entropy_diff)
+
+        # Longest streak of decreasing entropy (sustained convergence)
+        max_streak = 0
+        current_streak = 0
+        for d in entropy_diff:
+            if d < 0:
+                current_streak += 1
+                max_streak = max(max_streak, current_streak)
+            else:
+                current_streak = 0
+        feats["entropy_max_decrease_streak"] = max_streak / len(entropy_diff)
+
     else:
         raise Exception("This should not happen. Entropies should be available")
 
+    # --- Alternative Entropy (entropy of the 19 non-chosen tokens) ---
+    # Measures how the model's "second choices" are distributed
+    # High alt_entropy = many viable alternatives, model was unsure
+    # Low alt_entropy = alternatives concentrated on few tokens
+    if alt_entropies:
+        alt_entropy_array = np.array(alt_entropies)
+        feats["alt_entropy_avg"] = np.mean(alt_entropy_array)
+
+        # End-of-reasoning alternative entropy
+        alt_entropy_parts = np.array_split(alt_entropy_array, 3)
+        feats["alt_entropy_end"] = np.mean(alt_entropy_parts[2])
+    else:
+        feats["alt_entropy_avg"] = 0.0
+        feats["alt_entropy_end"] = 0.0
+
+    # --- Temporal Evolution of Margin (Trajectory Modeling) ---
     if margins:
         margin_array = np.array(margins)
-        margin_parts = np.array_split(margin_array, 3)
+        n_margins = len(margin_array)
 
+        # 3-part split averages
+        margin_parts = np.array_split(margin_array, 3)
         feats["margin_start"] = np.mean(margin_parts[0])
         feats["margin_middle"] = np.mean(margin_parts[1])
         feats["margin_end"] = np.mean(margin_parts[2])
 
-        # Convergence/Divergence trends
-        # Positive trend = confidence increases → GOOD
-        # Negative trend = confidence decreases → BAD
-        feats["margin_trend"] = feats["margin_end"] - feats["margin_start"]
-        feats["margin_delta_middle"] = feats["margin_middle"] - feats["margin_start"]
+        # --- Volatility & Dynamics ---
+        margin_diff = np.diff(margin_array)
+        feats["margin_volatility"] = np.std(margin_diff)  # confidence stability
+        feats["margin_max_drop"] = np.min(margin_diff)  # worst confidence drop
+
+        # --- Autocorrelation (clustering of confident/uncertain tokens) ---
+        if n_margins > 2:
+            margin_centered = margin_array - np.mean(margin_array)
+            autocorr_num = np.sum(margin_centered[:-1] * margin_centered[1:])
+            autocorr_denom = np.sum(margin_centered ** 2)
+            feats["margin_autocorr"] = autocorr_num / (autocorr_denom + 1e-9)
+        else:
+            feats["margin_autocorr"] = 0.0
+
+        # --- Monotonicity (direction consistency) ---
+        # What fraction of steps show increasing margin? (gaining confidence)
+        increasing_steps = np.sum(margin_diff > 0)
+        feats["margin_increase_rate"] = increasing_steps / len(margin_diff)
+
     else:
-        feats["margin_start"] = 0.0
-        feats["margin_middle"] = 0.0
-        feats["margin_end"] = 0.0
-        feats["margin_trend"] = 0.0
-        feats["margin_delta_middle"] = 0.0
+        raise Exception("Margins should be available")
 
     # --- 2. Global Static Statistics ---
     # Captures the general "mood" of the model across the entire reasoning trace.
@@ -166,9 +230,6 @@ def extract_meta_features(data: Dict[str, Any]) -> Dict[str, float]:
 
     # "Initial Shock": Confidence drop when moving from premise to complex evaluation
     feats["delta_middle_start"] = feats["middle_avg_lp"] - feats["start_avg_lp"]
-
-    # "Resolution Recovery": Confidence gain when moving to conclusion
-    feats["delta_end_middle"] = feats["end_avg_lp"] - feats["middle_avg_lp"]
 
     # "Overall Trend": Did the model end up more confident than it started?
     feats["trend_overall"] = feats["end_avg_lp"] - feats["start_avg_lp"]
